@@ -1,0 +1,41 @@
+{
+  "edges": [],
+  "groups": [
+    {
+      "id": "env_01a076bd51f89be2939a68544be4071e",
+      "kind": "environment",
+      "name": "udap-dev",
+      "purpose": "dev",
+      "ref": {
+        "id": "env_01a076bd51f89be2939a68544be4071e",
+        "kind": "environment"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "group": "env_01a076bd51f89be2939a68544be4071e",
+      "id": "svc_01a07f8edf8cc3f3f60efe2c42a2830b",
+      "kind": "service",
+      "name": "boot-hello",
+      "props": {
+        "cpu": "256",
+        "desired_count": 1,
+        "image_repository": "boot-hello",
+        "memory": "512",
+        "region": "us-east-1",
+        "task_family": "boot-hello"
+      },
+      "ref": {
+        "id": "svc_01a07f8edf8cc3f3f60efe2c42a2830b",
+        "kind": "service"
+      },
+      "type": "service.ecs"
+    }
+  ],
+  "scope": {
+    "id": "svc_01a07f8edf8cc3f3f60efe2c42a2830b",
+    "kind": "service"
+  },
+  "version": 1
+}

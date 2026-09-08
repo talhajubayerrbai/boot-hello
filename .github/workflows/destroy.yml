@@ -1,0 +1,79 @@
+name: destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Git ref (unused for destroy)"
+        required: false
+        default: ""
+      udap_run_id:
+        description: "UDAP run id"
+        required: false
+        default: ""
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPO_NAME: boot-hello
+  APP_RUNNER_SERVICE: boot-hello
+
+jobs:
+  destroy:
+    name: Tear down App Runner service and ECR repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Delete App Runner service
+        run: |
+          REGION="${{ vars.AWS_REGION }}"
+          SERVICE_ARN=$(aws apprunner list-services --region "$REGION" \
+            --query "ServiceSummaryList[?ServiceName=='${APP_RUNNER_SERVICE}'].ServiceArn" \
+            --output text 2>/dev/null)
+
+          if [ -n "$SERVICE_ARN" ] && [ "$SERVICE_ARN" != "None" ]; then
+            echo "Deleting App Runner service: $SERVICE_ARN"
+            aws apprunner delete-service \
+              --region "$REGION" \
+              --service-arn "$SERVICE_ARN"
+
+            echo "Waiting for deletion..."
+            MAX_WAIT=300
+            INTERVAL=10
+            ELAPSED=0
+            while [ $ELAPSED -lt $MAX_WAIT ]; do
+              STATUS=$(aws apprunner describe-service \
+                --region "$REGION" \
+                --service-arn "$SERVICE_ARN" \
+                --query "Service.Status" \
+                --output text 2>/dev/null || echo "DELETED")
+              echo "  status=$STATUS"
+              if [ "$STATUS" = "DELETED" ] || [ "$STATUS" = "" ]; then
+                echo "Service deleted."
+                break
+              fi
+              sleep $INTERVAL
+              ELAPSED=$((ELAPSED + INTERVAL))
+            done
+          else
+            echo "No App Runner service named $APP_RUNNER_SERVICE found; nothing to delete."
+          fi
+
+      - name: Delete ECR repository
+        run: |
+          REGION="${{ vars.AWS_REGION }}"
+          if aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" \
+              --region "$REGION" 2>/dev/null; then
+            echo "Deleting ECR repository: $ECR_REPO_NAME"
+            aws ecr delete-repository \
+              --region "$REGION" \
+              --repository-name "$ECR_REPO_NAME" \
+              --force
+          else
+            echo "ECR repository $ECR_REPO_NAME not found; nothing to delete."
+          fi

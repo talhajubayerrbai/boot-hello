@@ -1,0 +1,229 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Git ref or SHA to deploy"
+        required: false
+        default: ""
+      udap_run_id:
+        description: "UDAP run id"
+        required: false
+        default: ""
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPO_NAME: boot-hello
+  APP_RUNNER_SERVICE: boot-hello
+  APP_RUNNER_PORT: "8080"
+  CPU: "0.25 vCPU"
+  MEMORY: "0.5 GB"
+
+jobs:
+  build:
+    name: Build fat jar
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: maven
+
+      - name: Build fat jar
+        run: mvn package -DskipTests --batch-mode
+
+      - name: Upload jar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/app.jar
+          retention-days: 1
+
+  push:
+    name: Build & push image to ECR
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+
+      - name: Download jar artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Ensure ECR repository exists
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" \
+            --region "$AWS_REGION" 2>/dev/null \
+          || aws ecr create-repository \
+              --repository-name "$ECR_REPO_NAME" \
+              --region "$AWS_REGION" \
+              --image-scanning-configuration scanOnPush=true
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push Docker image
+        id: image
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to App Runner
+    runs-on: ubuntu-latest
+    needs: push
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Ensure App Runner ECR access role exists
+        id: role
+        run: |
+          ROLE_NAME="AppRunnerECRAccessRole"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+
+          # Create role if it does not exist
+          if ! aws iam get-role --role-name "$ROLE_NAME" 2>/dev/null; then
+            aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document '{
+                "Version":"2012-10-17",
+                "Statement":[{
+                  "Effect":"Allow",
+                  "Principal":{"Service":"build.apprunner.amazonaws.com"},
+                  "Action":"sts:AssumeRole"
+                }]
+              }'
+            aws iam attach-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-arn "arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess"
+          fi
+          echo "arn=$ROLE_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy or update App Runner service
+        run: |
+          IMAGE_URI="${{ needs.push.outputs.image_uri }}"
+          ROLE_ARN="${{ steps.role.outputs.arn }}"
+          REGION="${{ vars.AWS_REGION }}"
+
+          # Check if service already exists
+          SERVICE_ARN=$(aws apprunner list-services --region "$REGION" \
+            --query "ServiceSummaryList[?ServiceName=='${APP_RUNNER_SERVICE}'].ServiceArn" \
+            --output text 2>/dev/null)
+
+          if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" = "None" ]; then
+            echo "Creating new App Runner service..."
+            SERVICE_ARN=$(aws apprunner create-service \
+              --region "$REGION" \
+              --service-name "$APP_RUNNER_SERVICE" \
+              --source-configuration "{
+                \"AuthenticationConfiguration\": {
+                  \"AccessRoleArn\": \"${ROLE_ARN}\"
+                },
+                \"ImageRepository\": {
+                  \"ImageIdentifier\": \"${IMAGE_URI}\",
+                  \"ImageConfiguration\": {
+                    \"Port\": \"${APP_RUNNER_PORT}\"
+                  },
+                  \"ImageRepositoryType\": \"ECR\"
+                }
+              }" \
+              --instance-configuration "{
+                \"Cpu\": \"${CPU}\",
+                \"Memory\": \"${MEMORY}\"
+              }" \
+              --query "Service.ServiceArn" \
+              --output text)
+            echo "Created App Runner service: $SERVICE_ARN"
+          else
+            echo "Updating existing App Runner service: $SERVICE_ARN"
+            aws apprunner update-service \
+              --region "$REGION" \
+              --service-arn "$SERVICE_ARN" \
+              --source-configuration "{
+                \"AuthenticationConfiguration\": {
+                  \"AccessRoleArn\": \"${ROLE_ARN}\"
+                },
+                \"ImageRepository\": {
+                  \"ImageIdentifier\": \"${IMAGE_URI}\",
+                  \"ImageConfiguration\": {
+                    \"Port\": \"${APP_RUNNER_PORT}\"
+                  },
+                  \"ImageRepositoryType\": \"ECR\"
+                }
+              }"
+          fi
+
+          echo "SERVICE_ARN=$SERVICE_ARN" >> "$GITHUB_ENV"
+
+      - name: Wait for App Runner service to reach RUNNING state
+        run: |
+          REGION="${{ vars.AWS_REGION }}"
+          SERVICE_ARN="$SERVICE_ARN"
+          echo "Waiting for service $SERVICE_ARN to be RUNNING..."
+
+          MAX_WAIT=600   # 10 minutes
+          INTERVAL=15
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws apprunner describe-service \
+              --region "$REGION" \
+              --service-arn "$SERVICE_ARN" \
+              --query "Service.Status" \
+              --output text)
+            echo "  status=$STATUS (${ELAPSED}s elapsed)"
+
+            if [ "$STATUS" = "RUNNING" ]; then
+              SERVICE_URL=$(aws apprunner describe-service \
+                --region "$REGION" \
+                --service-arn "$SERVICE_ARN" \
+                --query "Service.ServiceUrl" \
+                --output text)
+              echo "App Runner service is RUNNING"
+              echo "Live URL: https://${SERVICE_URL}"
+              exit 0
+            fi
+
+            if [ "$STATUS" = "CREATE_FAILED" ] || [ "$STATUS" = "UPDATE_FAILED" ] || [ "$STATUS" = "DELETE_FAILED" ]; then
+              echo "Service reached failed state: $STATUS"
+              exit 1
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "Timed out waiting for service to reach RUNNING state after ${MAX_WAIT}s"
+          exit 1
